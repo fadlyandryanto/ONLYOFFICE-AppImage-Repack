@@ -1,0 +1,66 @@
+name: Build OnlyOffice AppImage
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Get Last Built Version
+        id: last_build
+        run: echo "version=$(cat last_version.txt || echo '0.0.0')" >> $GITHUB_OUTPUT
+
+      - name: Get Latest Upstream Release Tag
+        id: get_latest_version
+        run: |
+          LATEST_TAG=$(curl -s https://api.github.com/repos/ONLYOFFICE/DesktopEditors/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "full_version=$LATEST_TAG" >> $GITHUB_OUTPUT
+
+      - name: Install Headless Display Stack
+        if: steps.get_latest_version.outputs.full_version != steps.last_build.outputs.version
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libnss3 libgbm1 libasound2t64 libsecret-1-0
+
+      - name: Build Optimized AppImage
+        id: build
+        if: steps.get_latest_version.outputs.full_version != steps.last_build.outputs.version
+        run: |
+          sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns <<<0
+          chmod a+x build-onlyoffice-appimage.sh
+          xvfb-run -a ./build-onlyoffice-appimage.sh
+
+      - name: Deploy Production Release
+        if: steps.build.outputs.appimage_name
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.get_latest_version.outputs.full_version }}"
+          PAYLOAD="${{ steps.build.outputs.appimage_name }}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$PAYLOAD" --clobber
+          else
+            gh release create "$TAG" --title "Release $TAG" "$PAYLOAD"
+          fi
+
+      - name: Synchronize State Ledger
+        if: steps.build.outputs.appimage_name
+        run: |
+          echo "${{ steps.get_latest_version.outputs.full_version }}" > last_version.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add last_version.txt
+          git commit -m "chore: Update last built OnlyOffice version to ${{ steps.get_latest_version.outputs.full_version }}"
+          git push
